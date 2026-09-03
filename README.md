@@ -44,7 +44,7 @@ MAP_PYTHON=/path/to/miniconda3/envs/map/bin/python \
 LINGBOT_MAP_DIR=/path/to/lingbot-map \
 bash start_map.sh          # 默认端口 8200
 
-curl http://127.0.0.1:8200/health   # 确认就绪
+curl http://127.0.0.1:8200/health   # 确认确认就绪
 ```
 
 ### ① 提交建图任务
