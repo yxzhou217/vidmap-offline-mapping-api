@@ -1,0 +1,5 @@
+map_jobs/
+output/
+map_server.log
+__pycache__/
+*.pyc
