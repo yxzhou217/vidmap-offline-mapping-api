@@ -274,6 +274,16 @@ def main():
             prev[cj, ci] = [255, 0, 0]
     Image.fromarray(np.flipud(prev)).save(out_dir / "preview.png")
 
+    # 对齐参数存盘(3D 可视化/nav_mesh_to_html.py 用同一坐标系)
+    (out_dir / "alignment.json").write_text(json.dumps({
+        "R_total": R_total.tolist(),
+        "floor_z": floor_z,
+        "xy_min": xy_min.tolist(),
+        "resolution": res,
+        "z_min": args.z_min, "z_max": args.z_max,
+        "grid_W": W, "grid_H": H,
+    }))
+
     # 交互式 HTML 查看器(自包含,可拖动/缩放/切图层)
     write_grid_viewer(out_dir / "occupancy_viewer.html", grid, log_odds, cam_ij, res, xy_min)
 
