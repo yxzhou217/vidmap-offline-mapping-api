@@ -274,9 +274,108 @@ def main():
             prev[cj, ci] = [255, 0, 0]
     Image.fromarray(np.flipud(prev)).save(out_dir / "preview.png")
 
+    # 交互式 HTML 查看器(自包含,可拖动/缩放/切图层)
+    write_grid_viewer(out_dir / "occupancy_viewer.html", grid, log_odds, cam_ij, res, xy_min)
+
     n_occ = int((grid == 100).sum()); n_free = int((grid == 0).sum())
     print(f"栅格 {W}x{H} @ {res}m | 占据 {n_occ} 格, 空闲 {n_free} 格, 其余未知")
-    print(f"完成: {out_dir}/occupancy.pgm + occupancy.yaml + preview.png + mesh.ply")
+    print(f"完成: {out_dir}/occupancy.pgm + occupancy.yaml + preview.png + occupancy_viewer.html + mesh.ply")
+
+
+def _png_b64(arr: np.ndarray) -> str:
+    import base64, io
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def write_grid_viewer(path: Path, grid: np.ndarray, log_odds: np.ndarray,
+                      cam_ij: np.ndarray, res: float, xy_min: np.ndarray):
+    """自包含栅格查看器: 图层切换 + 滚轮缩放 + 拖动平移 + 坐标/尺度显示。"""
+    H, W = grid.shape
+    # 图层1: 占据三态(白空闲/黑占据/灰未知)
+    base = np.full((H, W, 3), 160, np.uint8)
+    base[grid == 0] = 255
+    base[grid == 100] = 0
+    # 图层2: log-odds 热力图
+    lo = np.clip(log_odds, -4, 4)
+    t = (lo + 4) / 8
+    heat = np.zeros((H, W, 3), np.uint8)
+    heat[..., 0] = (np.clip(t * 2 - 1, 0, 1) * 255).astype(np.uint8)        # 红=占据
+    heat[..., 2] = (np.clip(1 - t * 2, 0, 1) * 255).astype(np.uint8)        # 蓝=空闲
+    heat[grid == -1] = 200
+    # 轨迹层(透明底 RGBA)
+    traj = np.zeros((H, W, 4), np.uint8)
+    for ci, cj in cam_ij:
+        if 0 <= cj < H and 0 <= ci < W:
+            traj[cj, ci] = [255, 40, 40, 255]
+
+    layers = {
+        "occupancy": _png_b64(np.flipud(base)),
+        "logodds": _png_b64(np.flipud(heat)),
+        "trajectory": _png_b64(np.flipud(traj)),
+    }
+    html = _VIEWER_TEMPLATE.replace("__LAYERS__", json.dumps(layers)) \
+                           .replace("__W__", str(W)).replace("__H__", str(H)) \
+                           .replace("__RES__", str(res)) \
+                           .replace("__OX__", f"{xy_min[0]:.4f}").replace("__OY__", f"{xy_min[1]:.4f}")
+    Path(path).write_text(html)
+
+
+_VIEWER_TEMPLATE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>占据栅格查看器</title>
+<style>
+body{margin:0;background:#333;overflow:hidden;font:13px sans-serif}
+#bar{position:fixed;top:8px;left:8px;z-index:9;background:rgba(0,0,0,.55);color:#fff;
+padding:6px 10px;border-radius:6px;user-select:none}
+#bar label{margin-right:10px;cursor:pointer}
+#coord{position:fixed;bottom:8px;left:8px;color:#fff;background:rgba(0,0,0,.55);
+padding:4px 8px;border-radius:6px}
+</style></head><body>
+<div id="bar">
+  <label><input type="radio" name="layer" value="occupancy" checked> 占据图</label>
+  <label><input type="radio" name="layer" value="logodds"> log-odds 热力</label>
+  <label><input type="checkbox" id="traj" checked> 轨迹</label>
+  <span style="color:#aaa">拖动平移 · 滚轮缩放</span>
+</div>
+<div id="coord"></div>
+<canvas id="cv"></canvas>
+<script>
+const L = __LAYERS__, W = __W__, H = __H__, RES = __RES__, OX = __OX__, OY = __OY__;
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+function fit(){ cv.width = innerWidth; cv.height = innerHeight; draw(); }
+const imgs = {};
+for (const k in L){ const im = new Image(); im.src = 'data:image/png;base64,'+L[k]; im.onload = draw; imgs[k] = im; }
+let scale = 1, ox = 0, oy = 0, inited = false;
+function draw(){
+  ctx.fillStyle = '#333'; ctx.fillRect(0,0,cv.width,cv.height);
+  if (!inited){ scale = Math.min(cv.width/W, cv.height/H)*0.95;
+    ox = (cv.width - W*scale)/2; oy = (cv.height - H*scale)/2; inited = true; }
+  ctx.imageSmoothingEnabled = scale < 2;
+  const layer = document.querySelector('input[name=layer]:checked').value;
+  ctx.drawImage(imgs[layer], ox, oy, W*scale, H*scale);
+  if (document.getElementById('traj').checked)
+    ctx.drawImage(imgs.trajectory, ox, oy, W*scale, H*scale);
+}
+let drag = null;
+cv.onmousedown = e => drag = {x:e.clientX, y:e.clientY, ox, oy};
+onmouseup = () => drag = null;
+onmousemove = e => {
+  if (drag){ ox = drag.ox + e.clientX - drag.x; oy = drag.oy + e.clientY - drag.y; draw(); }
+  const gx = (e.clientX - ox)/scale, gy = H - (e.clientY - oy)/scale;
+  document.getElementById('coord').textContent =
+    (gx>=0 && gx<W && gy>=0 && gy<H) ?
+    `格(${(gx|0)}, ${(gy|0)})  世界(${(OX+gx*RES).toFixed(2)}m, ${(OY+gy*RES).toFixed(2)}m)` : '';
+};
+cv.onwheel = e => {
+  e.preventDefault();
+  const f = e.deltaY < 0 ? 1.15 : 1/1.15;
+  const mx = e.clientX, my = e.clientY;
+  ox = mx - (mx - ox)*f; oy = my - (my - oy)*f; scale *= f; draw();
+};
+document.querySelectorAll('input').forEach(el => el.onchange = draw);
+onresize = fit; fit();
+</script></body></html>"""
 
 
 if __name__ == "__main__":
