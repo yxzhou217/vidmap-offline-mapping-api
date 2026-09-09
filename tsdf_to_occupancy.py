@@ -108,7 +108,8 @@ def main():
     ap.add_argument("--z_min", type=float, default=0.10, help="障碍切片下界(地面以上米)")
     ap.add_argument("--z_max", type=float, default=1.50, help="障碍切片上界(地面以上米)")
     ap.add_argument("--resolution", type=float, default=0.05, help="占据栅格分辨率(米/格)")
-    ap.add_argument("--min_pts_per_cell", type=int, default=2, help="判定占据的最少点数")
+    ap.add_argument("--min_pts_per_cell", type=int, default=2, help="(已废弃,log-odds 模式不用)")
+    ap.add_argument("--occ_thresh", type=float, default=2.0, help="log-odds 占据判定阈值,越大越保守")
     args = ap.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -165,12 +166,12 @@ def main():
     points = np.asarray(pcd.points)
     print(f"离群点剔除后: {len(points)} 点")
 
-    # ---- 5. 重力对齐: 先粗(点云最小跨度轴)后精(低位点 RANSAC 地面) ----
+    # ---- 5. 重力对齐: 先粗(点云 PCA)后精(低位点 RANSAC 地面) ----
     cam_centers = np.array([fr["c2w"][:3, 3] for fr in frames])
     up = estimate_up_axis(points, cam_centers)
-    R = rotation_aligning_z(up)
-    points = points @ R.T
-    cam_centers = cam_centers @ R.T
+    R_total = rotation_aligning_z(up)
+    points = points @ R_total.T
+    cam_centers = cam_centers @ R_total.T
 
     # 精修: 最低 15% 的点做 RANSAC 平面(此时地面法线≈Z),再用平面法线重对齐
     low = points[points[:, 2] < np.percentile(points[:, 2], 15)]
@@ -179,39 +180,82 @@ def main():
     n = np.asarray(plane[:3]); n = n if n[2] >= 0 else -n
     if n[2] > 0.95:
         R2 = rotation_aligning_z(n)
+        R_total = R2 @ R_total
         points = points @ R2.T
         cam_centers = cam_centers @ R2.T
         print(f"[重力] 地面 RANSAC 精修, 法线 {n.round(3)}")
     floor_z = float(np.mean(low[inliers, 2])) if len(inliers) > 100 else float(np.percentile(points[:, 2], 5))
     print(f"地面 z={floor_z:.2f}, 相机高度中位 {np.median(cam_centers[:, 2] - floor_z):.2f} m")
 
-    # ---- 6. 切片 + 占据栅格 ----
-    band = (points[:, 2] > floor_z + args.z_min) & (points[:, 2] < floor_z + args.z_max)
-    obs = points[band][:, :2]
-    margin = 1.0
-    xy_min = np.minimum(obs.min(0), cam_centers[:, :2].min(0)) - margin
-    xy_max = np.maximum(obs.max(0), cam_centers[:, :2].max(0)) + margin
+    # ---- 6. log-odds 占据栅格(射线投票: 命中=占据证据, 穿过=空闲证据) ----
+    # 幻影点会被其它视角穿过的射线否决, 真障碍被反复命中留下
+    import cv2
     res = args.resolution
+
+    # 第一遍: 逐帧反投影(深度图原生分辨率,不放大),收集射线端点
+    frame_rays = []   # 每帧: (cam_xy, endpoints_xy(N,2), in_band(N,))
+    all_band_xy = []
+    with h5py.File(depth_h5) as f:
+        for fr in frames:
+            if fr["name"] not in f:
+                continue
+            grp = f[fr["name"]]
+            depth = np.asarray(grp["depth"], dtype=np.float32)
+            valid = np.asarray(grp["valid"])
+            hd, wd = depth.shape
+            depth = depth * scales.get(fr["image_id"], 1.0)
+            K = fr["K"].copy()
+            K[0] *= wd / fr["w"]; K[1] *= hd / fr["h"]     # 内参 → 深度图原生分辨率
+
+            stride = 4
+            us, vs = np.meshgrid(np.arange(0, wd, stride), np.arange(0, hd, stride))
+            d = depth[::stride, ::stride].reshape(-1)
+            vv = valid[::stride, ::stride].reshape(-1)
+            keep = vv & (d > 0.3) & (d < args.depth_trunc)
+            u = us.reshape(-1)[keep]; v_ = vs.reshape(-1)[keep]; d = d[keep]
+            rays_c = np.stack([u, v_, np.ones_like(u)], 0)          # 像素齐次
+            Xc = np.linalg.inv(K) @ rays_c * d                       # 相机系
+            Xa = R_total @ (fr["c2w"][:3, :3] @ Xc + fr["c2w"][:3, 3:4])  # 对齐系
+            in_band = (Xa[2] > floor_z + args.z_min) & (Xa[2] < floor_z + args.z_max)
+            cam_xy = (R_total @ fr["c2w"][:3, 3])[:2]
+            frame_rays.append((cam_xy, Xa[:2].T, in_band))
+            all_band_xy.append(Xa[:2, in_band].T)
+
+    band_xy = np.concatenate(all_band_xy) if all_band_xy else np.zeros((0, 2))
+    margin = 1.0
+    xy_min = np.minimum(band_xy.min(0), cam_centers[:, :2].min(0)) - margin
+    xy_max = np.maximum(band_xy.max(0), cam_centers[:, :2].max(0)) + margin
     W = int(np.ceil((xy_max[0] - xy_min[0]) / res))
     H = int(np.ceil((xy_max[1] - xy_min[1]) / res))
-    grid = np.full((H, W), -1, dtype=np.int8)             # -1 未知, 0 空闲, 100 占据
 
-    ij = np.floor((obs - xy_min) / res).astype(int)
-    counts = np.zeros((H, W), dtype=np.int32)
-    np.add.at(counts, (ij[:, 1], ij[:, 0]), 1)
-    grid[counts >= args.min_pts_per_cell] = 100
+    occ_votes = np.zeros((H, W), np.int32)
+    free_votes = np.zeros((H, W), np.int32)
+    for fi, (cam_xy, pts_xy, in_band) in enumerate(frame_rays):
+        ci, cj = np.floor((cam_xy - xy_min) / res).astype(int)
+        ij = np.floor((pts_xy - xy_min) / res).astype(int)
+        ok = (ij[:, 0] >= 0) & (ij[:, 0] < W) & (ij[:, 1] >= 0) & (ij[:, 1] < H)
+        ij, in_b = ij[ok], in_band[ok]
+        occ_ij = ij[in_b]                                # 占据投票: 带内端点
+        np.add.at(occ_votes, (occ_ij[:, 1], occ_ij[:, 0]), 1)
+        mask = np.zeros((H, W), np.uint8)                # 空闲投票: 射线途经(隔一抽稀)
+        for i, j in ij[::2]:
+            cv2.line(mask, (ci, cj), (i, j), 1, thickness=1)
+        free_votes += mask
+        if fi % 60 == 0:
+            print(f"射线投票 {fi}/{len(frame_rays)}")
 
-    # 空闲: 从每个相机中心向占据格画 2D 光线(cv2.line, C 实现)
-    # 光线经过的未知格 → 空闲;不覆盖占据格
-    import cv2
+    log_odds = 0.85 * occ_votes - 0.4 * free_votes
+    grid = np.full((H, W), -1, dtype=np.int8)            # -1 未知, 0 空闲, 100 占据
+    grid[log_odds > args.occ_thresh] = 100
+    grid[(log_odds <= args.occ_thresh) & (free_votes > 0)] = 0
+
+    # 形态学清理: 开运算去掉孤立噪点格, 闭运算补障碍内部小洞
+    occ_mask = (grid == 100).astype(np.uint8)
+    kernel = np.ones((3, 3), np.uint8)
+    occ_mask = cv2.morphologyEx(occ_mask, cv2.MORPH_OPEN, kernel)
+    occ_mask = cv2.morphologyEx(occ_mask, cv2.MORPH_CLOSE, kernel)
+    grid = np.where(occ_mask == 1, 100, np.where(free_votes > 0, 0, -1)).astype(np.int8)
     cam_ij = np.floor((cam_centers[:, :2] - xy_min) / res).astype(int)
-    occ_cells = np.argwhere(grid == 100)                    # (row, col)
-    free_mask = np.zeros((H, W), dtype=np.uint8)
-    step = max(1, len(occ_cells) // 50000)                  # 占据格太多则抽稀
-    for ci, cj in cam_ij:
-        for j, i in occ_cells[::step]:
-            cv2.line(free_mask, (ci, cj), (i, j), 1, thickness=1)
-    grid[(free_mask == 1) & (grid == -1)] = 0
 
     # ---- 7. 导出 ----
     occ_u8 = np.full_like(grid, 205, dtype=np.uint8)      # ROS: 未知=205
