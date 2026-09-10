@@ -30,11 +30,14 @@ def b64(arr: np.ndarray) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--nav_map", required=True, help="tsdf_to_occupancy.py 的输出目录")
+    ap.add_argument("--nav_map", required=True, help="tsdf_to_occupancy.py / mvs_to_occupancy.py 的输出目录")
     ap.add_argument("--mesh", default=None, help="mesh.ply 路径(默认 <nav_map>/mesh.ply)")
+    ap.add_argument("--points", default=None,
+                    help="点云 ply 路径(如 fused_aligned.ply, 已对齐过, 只补地面平移; 与 --mesh 二选一)")
     ap.add_argument("--output_dir", default=None, help="vidmap 输出目录(叠加轨迹用,可选)")
     ap.add_argument("--out", default=None, help="默认 <nav_map>/nav_3d.html")
     ap.add_argument("--target_tris", type=int, default=400000)
+    ap.add_argument("--max_points", type=int, default=800000)
     args = ap.parse_args()
 
     nav_map = Path(args.nav_map)
@@ -45,21 +48,33 @@ def main():
     z_max = al["z_max"]
     xy_min = np.array(al["xy_min"])
 
-    # ---- mesh: 用存档的对齐变换,地面移到 z=0 ----
-    mesh = o3d.io.read_triangle_mesh(str(args.mesh or nav_map / "mesh.ply"))
-    verts = np.asarray(mesh.vertices) @ R_total.T
-    verts[:, 2] -= floor_z
-    tris = np.asarray(mesh.triangles)
-    colors = (np.asarray(mesh.vertex_colors) * 255).astype(np.uint8)
-    print(f"mesh: {len(verts)} 顶点, {len(tris)} 三角形")
-    if len(tris) > args.target_tris:
-        m2 = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(verts),
-                                       o3d.utility.Vector3iVector(tris))
-        m2.vertex_colors = o3d.utility.Vector3dVector(colors / 255.0)
-        m2 = m2.simplify_quadric_decimation(args.target_tris)
-        verts = np.asarray(m2.vertices); tris = np.asarray(m2.triangles)
-        colors = (np.asarray(m2.vertex_colors) * 255).astype(np.uint8)
-        print(f"抽稀后: {len(verts)} 顶点, {len(tris)} 三角形")
+    # ---- 几何: mesh 或点云; 地面移到 z=0 ----
+    point_mode = args.points is not None
+    if point_mode:
+        pcd = o3d.io.read_point_cloud(args.points)
+        verts = np.asarray(pcd.points)              # fused_aligned.ply 已乘过 R_total
+        verts[:, 2] -= floor_z
+        colors = (np.asarray(pcd.colors) * 255).astype(np.uint8)
+        if len(verts) > args.max_points:            # 抽稀控制文件体积
+            sel = np.random.default_rng(0).choice(len(verts), args.max_points, replace=False)
+            verts, colors = verts[sel], colors[sel]
+        tris = np.zeros((0, 3), np.uint32)
+        print(f"点云: {len(verts)} 点(已对齐)")
+    else:
+        mesh = o3d.io.read_triangle_mesh(str(args.mesh or nav_map / "mesh.ply"))
+        verts = np.asarray(mesh.vertices) @ R_total.T
+        verts[:, 2] -= floor_z
+        tris = np.asarray(mesh.triangles)
+        colors = (np.asarray(mesh.vertex_colors) * 255).astype(np.uint8)
+        print(f"mesh: {len(verts)} 顶点, {len(tris)} 三角形")
+        if len(tris) > args.target_tris:
+            m2 = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(verts),
+                                           o3d.utility.Vector3iVector(tris))
+            m2.vertex_colors = o3d.utility.Vector3dVector(colors / 255.0)
+            m2 = m2.simplify_quadric_decimation(args.target_tris)
+            verts = np.asarray(m2.vertices); tris = np.asarray(m2.triangles)
+            colors = (np.asarray(m2.vertex_colors) * 255).astype(np.uint8)
+            print(f"抽稀后: {len(verts)} 顶点, {len(tris)} 三角形")
 
     # ---- 占据栅格 → 障碍立柱位置(pgm 读回: 0=占据 254=空闲 205=未知, 存储时 flipud 过) ----
     grid_img = np.asarray(Image.open(nav_map / "occupancy.pgm"))
@@ -88,6 +103,7 @@ def main():
 
     payload = {
         "positions": b64(verts.astype(np.float32)),
+        "mode": "points" if point_mode else "mesh",
         "colors": b64(colors),
         "indices": b64(tris.astype(np.uint32).reshape(-1)),
         "occPos": b64(occ_pos), "occSize": [res, res, z_max],
@@ -136,10 +152,15 @@ geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
 const colF = new Float32Array(col.length);
 for (let i=0;i<col.length;i++) colF[i]=col[i]/255;
 geo.setAttribute('color', new THREE.BufferAttribute(colF, 3));
-geo.setIndex(new THREE.BufferAttribute(idx, 1));
-geo.computeVertexNormals();
-const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
-  vertexColors:true, side:THREE.DoubleSide, transparent:true, opacity:0.35}));
+let mesh;
+if (D.mode === 'points') {
+  mesh = new THREE.Points(geo, new THREE.PointsMaterial({vertexColors:true, size:0.02}));
+} else {
+  geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  geo.computeVertexNormals();
+  mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+    vertexColors:true, side:THREE.DoubleSide, transparent:true, opacity:0.35}));
+}
 world.add(mesh);
 
 // 障碍立柱(InstancedMesh)
